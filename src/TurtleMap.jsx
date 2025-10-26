@@ -20,7 +20,6 @@ const dataFilterExtension = new DataFilterExtension({
   countItems: true
 });
 
-
 const convertIndexToDateRange = (timeIndex, startDateString) => {
     if (!startDateString) return 'Loading Dates...';
     
@@ -122,14 +121,15 @@ function TimeSlider({ min, max, value, onChange, minDateString, isPlaying, speed
     );
 }
 
-
 export default function TurtleMap({ 
-    csvUrl = '/predicted_turtle_data.csv',
-    metadataUrl = '/turtle_metadata.json' 
+    turtleCsvUrl = '/predicted_turtle_data.csv',
+    turtleMetadataUrl = '/turtle_metadata.json',
+    vesselCsvUrl = '/public-global-presence-v3.0.csv'  // New vessel data CSV URL
 }) {
     const [viewState, setViewState] = useState(INITIAL_VIEW_STATE);
-    const [data, setData] = useState(null); 
+    const [turtleData, setTurtleData] = useState(null); 
     const [trendData, setTrendData] = useState(null); 
+    const [vesselData, setVesselData] = useState(null);  // New vessel data state
     const [maxTime, setMaxTime] = useState(0);
     const [minDate, setMinDate] = useState(null); 
     const [timeFilterStart, setTimeFilterStart] = useState(0.0); 
@@ -145,12 +145,10 @@ export default function TurtleMap({
     useEffect(() => { speedRef.current = speed; }, [speed]);
     useEffect(() => { timeFilterRef.current = timeFilterStart; }, [timeFilterStart]);
     useEffect(() => { maxTimeRef.current = maxTime; }, [maxTime]);
-    
 
     const animate = useCallback(() => {
         //only run if playing
         if (!isPlaying) return;
-
 
         const FPS = 60;
         const STEP_PER_FRAME = speedRef.current / FPS;
@@ -166,7 +164,6 @@ export default function TurtleMap({
         requestAnimationFrame(animate);
     }, [isPlaying]);
 
-
     useEffect(() => {
         if (isPlaying) {
             const animationFrame = requestAnimationFrame(animate);
@@ -174,98 +171,113 @@ export default function TurtleMap({
         }
     }, [isPlaying, animate]);
 
-
+    // Fetch turtle and vessel data
     useEffect(() => {
-        fetch(metadataUrl)
-            .then(res => res.json())
-            .then(meta => {
-                setMinDate(meta.minDate);
-                setMaxTime(meta.maxTimeIndex); 
-                setTimeFilterStart(0.0); 
-                
-                return fetch(csvUrl);
-            })
-            .then(response => response.text())
-            .then(text => {
-                const rows = text.trim().split('\n').slice(1);
-                const parsedData = rows.map(row => {
-                    const [latitude, longitude, time_index, is_trend_str] = row.split(','); 
-                    return { 
-                        latitude: parseFloat(latitude), 
-                        longitude: parseFloat(longitude), 
-                        time_index: parseInt(time_index, 10), 
-                        is_trend: is_trend_str.toLowerCase() === 'true'
-                    };
-                });
-                
-                const referenceDate = new Date(minDate);
-                const cutoffDate = new Date('2015-01-01');
-                const cutoffIndex = Math.floor((cutoffDate.getTime() - referenceDate.getTime()) / (1000 * 60 * 60 * 24));
+        Promise.all([
+            fetch(turtleMetadataUrl).then(res => res.json()),
+            fetch(turtleCsvUrl).then(res => res.text()),
+            fetch(vesselCsvUrl).then(res => res.text())
+        ])
+        .then(([meta, turtleCsv, vesselCsv]) => {
+            setMinDate(meta.minDate);
+            setMaxTime(meta.maxTimeIndex); 
+            setTimeFilterStart(0.0); 
 
-                const filteredData = parsedData.filter(d => d.time_index >= cutoffIndex);
+            // Process turtle data
+            const turtleRows = turtleCsv.trim().split('\n').slice(1);
+            const parsedTurtleData = turtleRows.map(row => {
+                const [latitude, longitude, time_index, is_trend_str] = row.split(','); 
+                return { 
+                    latitude: parseFloat(latitude), 
+                    longitude: parseFloat(longitude), 
+                    time_index: parseInt(time_index, 10), 
+                    is_trend: is_trend_str.toLowerCase() === 'true'
+                };
+            });
 
-                const turtleData = filteredData.filter(d => !d.is_trend);
-                const trendData = filteredData.filter(d => d.is_trend);
+            const filteredTurtleData = parsedTurtleData.filter(d => d.time_index >= 0);
+            setTurtleData(filteredTurtleData.filter(d => !d.is_trend));
+            setTrendData(filteredTurtleData.filter(d => d.is_trend));
 
-                setData(turtleData); 
-                setTrendData(trendData); 
-            })
-            .catch(error => console.error("Could not load data or metadata:", error));
-    }, [csvUrl, metadataUrl, minDate]);
+            // Process vessel data
+            const vesselRows = vesselCsv.trim().split('\n').slice(1);
+            const parsedVesselData = vesselRows.map(row => {
+                const [latitude, longitude, date, id, presence_hours] = row.split(',');
+                return { 
+                    latitude: parseFloat(latitude), 
+                    longitude: parseFloat(longitude), 
+                    date: new Date(date), 
+                    presence_hours: parseFloat(presence_hours)
+                };
+            });
 
+            setVesselData(parsedVesselData);
+        })
+        .catch(error => console.error("Could not load data:", error));
+    }, [turtleCsvUrl, turtleMetadataUrl, vesselCsvUrl]);
 
     const layers = useMemo(() => {
-        if (!data || !trendData) return [];
-        
-        const integerDay = Math.floor(timeFilterStart);
-        
-        const filterRange = [
-            integerDay, 
-            integerDay + TIME_WINDOW_DAYS 
-        ];
-        
-        const OPACITY = 180;
+    if (!turtleData || !trendData || !vesselData) return [];
 
-        return [
-            // 1. Predicted Trend Path
-            new ScatterplotLayer({
-                id: 'turtle-trend-path',
-                data: trendData,
-                getPosition: d => [d.longitude, d.latitude],
-                getFillColor: [0, 255, 255, OPACITY], 
-                getRadius: 150, 
-                radiusScale: 50,
-                pickable: false,
+    const integerDay = Math.floor(timeFilterStart);
+    const filterRange = [integerDay, integerDay + TIME_WINDOW_DAYS];
 
-                extensions: [new DataFilterExtension({ filterSize: 1, countItems: true, soft: true })],
-                getFilterValue: d => d.time_index,
-                filterRange: filterRange,
+    const OPACITY = 180;
 
-                updateTriggers: {
-                    getPosition: [timeFilterStart]
-                },
-                getPixelOffset: [0, 0],
+    // Define the current year from minDate
+    const currentYear = new Date(minDate).getFullYear(); 
+
+    return [
+        // Turtle trend data layer
+        new ScatterplotLayer({
+            id: 'turtle-trend-path',
+            data: trendData,
+            getPosition: d => [d.longitude, d.latitude],
+            getFillColor: [0, 255, 255, OPACITY], 
+            getRadius: 150, 
+            radiusScale: 50,
+            pickable: false,
+            extensions: [new DataFilterExtension({ filterSize: 1, countItems: true, soft: true })],
+            getFilterValue: d => d.time_index,
+            filterRange: filterRange,
+            updateTriggers: { getPosition: [timeFilterStart] }
+        }),
+        // Turtle locations layer
+        new ScatterplotLayer({
+            id: 'turtle-locations-filtered',
+            data: turtleData,
+            getPosition: d => [d.longitude, d.latitude],
+            getFillColor: [255, 165, 0, OPACITY], 
+            getRadius: 100,
+            radiusScale: 50,
+            pickable: true,
+            extensions: [dataFilterExtension],
+            getFilterValue: d => d.time_index, 
+            filterRange: filterRange, 
+            onFilteredItemsChange: ({ count }) => setFilteredCount(count)
+        }),
+        // Vessel data layer (new)
+        new ScatterplotLayer({
+            id: 'vessel-locations',
+            data: vesselData.filter(d => {
+                const vesselDate = new Date(d.date);
+                const vesselDayOfYear = Math.floor((vesselDate - new Date(vesselDate.getFullYear(), 0, 0)) / (1000 * 60 * 60 * 24));
+
+                const currentDate = new Date(minDate);
+                currentDate.setFullYear(currentYear);  
+
+                const timeFilterDayOfYear = Math.floor((new Date(minDate).setFullYear(currentYear) - new Date(currentYear, 0, 0)) / (1000 * 60 * 60 * 24));
+
+                return vesselDayOfYear === timeFilterDayOfYear;
             }),
-            
-            new ScatterplotLayer({
-                id: 'turtle-locations-filtered',
-                data: data,
-                getPosition: d => [d.longitude, d.latitude],
-                getFillColor: [255, 165, 0, OPACITY], 
-                getRadius: 100,
-                radiusScale: 50,
-                pickable: true,
-                
-                extensions: [dataFilterExtension],
-                getFilterValue: d => d.time_index, 
-                filterRange: filterRange, 
-                
-                onFilteredItemsChange: ({ count }) => {
-                    setFilteredCount(count);
-                }
-            })
-        ];
-    }, [data, trendData, timeFilterStart]);
+            getPosition: d => [d.longitude, d.latitude],
+            getFillColor: [0, 0, 255, OPACITY],  
+            getRadius: d => d.presence_hours * 2,  //larger radius for more presence hours
+            radiusScale: 10,
+            pickable: true
+        })
+    ];
+}, [turtleData, trendData, vesselData, timeFilterStart, minDate]);
 
 
     return (
@@ -281,8 +293,8 @@ export default function TurtleMap({
                     style={{ width: '100%', height: '100%' }}
                 />
             </DeckGL>
-            
-            {data && trendData && minDate && (
+
+            {turtleData && trendData && minDate && vesselData && (
                 <>
                     <TimeSlider 
                         min={0} 
